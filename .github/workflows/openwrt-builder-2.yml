@@ -1,0 +1,240 @@
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+#
+# File: .github/workflows/openwrt-builder.yml
+# Description: Build OpenWrt using GitHub Actions（优化版）
+#
+# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
+# This is free software, licensed under the MIT License.
+#
+
+name: OpenWrt Builder
+
+on:
+  # 只响应 update-checker 派发的事件，避免被其他 dispatch 误触发
+  repository_dispatch:
+    types: [Source Code Update]
+  workflow_dispatch:
+
+# 同一时间只允许一个构建在跑：
+#  - 防止并发任务互相覆盖 Release / 争抢缓存
+#  - cancel-in-progress: false 表示排队而不是掐断正在跑的任务
+concurrency:
+  group: openwrt-builder
+  cancel-in-progress: false
+
+# 显式声明权限，不依赖仓库默认设置（发 Release / 删运行记录需要写权限）
+permissions:
+  contents: write
+  actions: write
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+  # ── ccache 相关（二次编译提速的核心）────────────────────────
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 5G
+  CCACHE_COMPRESS: true
+
+jobs:
+  build:
+    # ubuntu-22.04 镜像已下线，必须使用 24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355        # 略小于硬上限 360，留出收尾时间（超时前能正常上传产物）
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        persist-credentials: false
+
+    # ── 恢复 ccache（放在最前面，越早越好，后续所有编译步骤都能吃到）──
+    - name: Restore ccache
+      uses: actions/cache@v4
+      with:
+        path: .ccache
+        # 机型配置变了就换一套缓存，避免不同 .config 之间互相污染
+        key: ccache-${{ runner.os }}-${{ hashFiles('.config') }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ hashFiles('.config') }}-
+          ccache-${{ runner.os }}-
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # 腾磁盘：runner 预装了一堆用不到的巨型工具链
+        sudo rm -rf /etc/apt/sources.list.d/* \
+                    /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/lib/jvm/temurin-* \
+                    /usr/share/swift /usr/share/miniconda /opt/az \
+                    /usr/lib/google-cloud-sdk /usr/lib/mono
+        sudo docker image prune --all --force
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+          build-essential bzip2 ccache cmake cpio curl device-tree-compiler \
+          fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged \
+          help2man intltool libc6-dev-i386 libelf-dev libfuse-dev \
+          libglib2.0-dev libgmp-dev libltdl-dev libmpc-dev libmpfr-dev \
+          libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool \
+          lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf \
+          python3 python3-pyelftools python3-setuptools qemu-utils rsync scons \
+          squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim \
+          wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+        df -hT
+      # 注：原版依赖里的 python2.7 / libncurses5-dev / libgmp3-dev 在 24.04 源里已不存在。
+      # 若 mkisofs 报 unable to locate，把 mkisofs 换成 genisoimage 即可。
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        # --depth 1 只拉最后一版，省几十秒到几分钟的克隆时间并大幅省磁盘
+        # 如果你的 diy-part1.sh 里用到了 git log / git describe 等历史操作，请去掉 --depth 1
+        git clone --single-branch --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Load custom feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P1_SH
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+        # 打开 OpenWrt 自带的 ccache 支持（幂等：已开启则不重复追加）
+        grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make defconfig
+        # 下载失败不会中断 make，重试 3 次以对抗偶发网络抖动
+        for i in 1 2 3; do
+          make download -j$(nproc) && break || echo "第 $i 次下载未完成，重试"
+        done
+        # 小于 1KB 的几乎都是 404 页面等残包，留着会在编译时以"文件损坏"形式炸掉
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        # 并行失败 → 单线程重跑 → 单线程 + V=s 打完整命令；日志全程落盘便于事后排查
+        make -j$(nproc) 2>&1 | tee build.log \
+          || make -j1 2>&1 | tee build.log \
+          || make -j1 V=s 2>&1 | tee build.log
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Show ccache statistics
+      if: always()
+      run: ccache -s || true
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    # 编译失败时把日志传上来，否则 6 小时的任务失败后你只能看到一句 exit 2
+    - name: Upload build log on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-failure-log${{ env.FILE_DATE }}
+        path: openwrt/build.log
+        retention-days: 7
+        if-no-files-found: ignore
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@v4
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+        retention-days: 7
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+        retention-days: 7
+        if-no-files-found: error
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        # 原模板里对 UPLOAD_GOFILE / steps.gofile 的引用是残留代码，
+        # 变量未定义会导致 bash 返回非 0 并中断本步骤，Release 上传因此被跳过 —— 已删除
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
