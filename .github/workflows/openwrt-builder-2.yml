@@ -8,7 +8,7 @@
 # This is free software, licensed under the MIT License.
 #
 
-name: OpenWrt Builder
+name: OpenWrt Builder2
 
 on:
   # 只响应 update-checker 派发的事件，避免被其他 dispatch 误触发
